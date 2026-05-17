@@ -24,12 +24,46 @@ function isOliveGreen(r: number, g: number, b: number): boolean {
 }
 
 /**
+ * Detect if a pixel color is blue (water/sea areas)
+ * Blue is roughly RGB(0-150, 100-200, 200-255)
+ */
+function isBlue(r: number, g: number, b: number): boolean {
+	return r <= 150 && g >= 100 && g <= 200 && b >= 200;
+}
+
+/**
+ * Detect if a pixel color is brown (contours/earth features)
+ * Brown is roughly RGB(110-190, 70-140, 20-90)
+ */
+function isBrown(r: number, g: number, b: number): boolean {
+	return r >= 110 && r <= 190 && g >= 70 && g <= 140 && b >= 20 && b <= 90;
+}
+
+/**
+ * Detect if a pixel color is pink (course overlays/symbols)
+ * Pink is roughly RGB(180-255, 60-180, 120-255)
+ */
+function isPink(r: number, g: number, b: number): boolean {
+	return r >= 180 && r <= 255 && g >= 60 && g <= 180 && b >= 120 && b <= 255;
+}
+
+/**
+ * Detect if a pixel color is turquoise/cyan
+ * Turquoise is roughly RGB(40-140, 130-255, 130-255)
+ */
+function isTurquoise(r: number, g: number, b: number): boolean {
+	return r >= 40 && r <= 140 && g >= 130 && g <= 255 && b >= 130 && b <= 255;
+}
+
+/**
  * Detect if a pixel color is black (buildings/houses)
  */
 function isBlack(r: number, g: number, b: number): boolean {
-	return r < 50 && g < 50 && b < 50;
+	// Treat very dark gray as black too, since map symbols/buildings are not pure #000
+	const isVeryDark = r < 90 && g < 90 && b < 90;
+	const lowBrightness = r + g + b < 210;
+	return isVeryDark && lowBrightness;
 }
-
 /**
  * Check if a location is valid (not olive green, not black houses in olive areas)
  * Uses the map canvas to sample pixel colors
@@ -62,7 +96,7 @@ function isValidLocation(
 
 		const data = imageData.data;
 
-		// Check if any sampled pixels are olive green or black
+		// Check if any sampled pixels are olive green, blue, brown, or black
 		for (let i = 0; i < data.length; i += 4) {
 			const r = data[i];
 			const g = data[i + 1];
@@ -71,7 +105,14 @@ function isValidLocation(
 
 			if (a > 200) {
 				// Only check non-transparent pixels
-				if (isOliveGreen(r, g, b) || isBlack(r, g, b)) {
+				if (
+					isOliveGreen(r, g, b) ||
+					isBlack(r, g, b) ||
+					isBlue(r, g, b) ||
+					isBrown(r, g, b) ||
+					isPink(r, g, b) ||
+					isTurquoise(r, g, b)
+				) {
 					return false;
 				}
 			}
@@ -124,6 +165,68 @@ function generateRandomPoint(
 	return [lat, lng];
 }
 
+function getOrientation(
+	a: [number, number],
+	b: [number, number],
+	c: [number, number]
+): number {
+	const value = (b[1] - a[1]) * (c[0] - b[0]) - (b[0] - a[0]) * (c[1] - b[1]);
+	if (Math.abs(value) < 1e-12) return 0;
+	return value > 0 ? 1 : 2;
+}
+
+function isPointOnSegment(
+	a: [number, number],
+	b: [number, number],
+	c: [number, number]
+): boolean {
+	return (
+		b[0] <= Math.max(a[0], c[0]) &&
+		b[0] >= Math.min(a[0], c[0]) &&
+		b[1] <= Math.max(a[1], c[1]) &&
+		b[1] >= Math.min(a[1], c[1])
+	);
+}
+
+function segmentsIntersect(
+	p1: [number, number],
+	q1: [number, number],
+	p2: [number, number],
+	q2: [number, number]
+): boolean {
+	const o1 = getOrientation(p1, q1, p2);
+	const o2 = getOrientation(p1, q1, q2);
+	const o3 = getOrientation(p2, q2, p1);
+	const o4 = getOrientation(p2, q2, q1);
+
+	if (o1 !== o2 && o3 !== o4) {
+		return true;
+	}
+
+	if (o1 === 0 && isPointOnSegment(p1, p2, q1)) return true;
+	if (o2 === 0 && isPointOnSegment(p1, q2, q1)) return true;
+	if (o3 === 0 && isPointOnSegment(p2, p1, q2)) return true;
+	if (o4 === 0 && isPointOnSegment(p2, q1, q2)) return true;
+
+	return false;
+}
+
+function createsRouteOverlap(
+	routePoints: [number, number][],
+	candidate: [number, number]
+): boolean {
+	if (routePoints.length < 3) return false;
+
+	const lastPoint = routePoints[routePoints.length - 1];
+	for (let i = 0; i < routePoints.length - 2; i++) {
+		if (segmentsIntersect(routePoints[i], routePoints[i + 1], lastPoint, candidate)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /**
  * Generate an orienteering course with specified parameters
  */
@@ -136,7 +239,6 @@ export function generateCourse(
 ): OrienteeringCourse {
 	const controlPoints: ControlPoint[] = [];
 	const maxDistanceMeters = (distanceKm * 1000) / (numControls + 1); // Distribute distance across all legs
-	const maxSearchRadius = Math.min(distanceKm * 1000, 5000); // Max 5km search radius
 
 	let attempts = 0;
 	const maxAttempts = 100;
@@ -162,12 +264,25 @@ export function generateCourse(
 	let currentLat = startLat;
 	let currentLng = startLng;
 
+	const MIN_CONTROL_DISTANCE = 300; // Minimum 300 meters between controls
+
 	for (let i = 0; i < numControls && attempts < maxAttempts; i++) {
 		let foundValid = false;
-		for (let attempt = 0; attempt < 10; attempt++) {
+		for (let attempt = 0; attempt < 20; attempt++) {
 			const [nextLat, nextLng] = generateRandomPoint(currentLat, currentLng, maxDistanceMeters);
+			const candidatePoint: [number, number] = [nextLat, nextLng];
+			const routePoints: [number, number][] = [
+				[startPoint.lat, startPoint.lng],
+				...controlPoints.map((control) => [control.lat, control.lng] as [number, number])
+			];
 
-			if (isValidLocation(map, nextLat, nextLng)) {
+			// Check if distance is at least 300 meters
+			const distance = getDistance(currentLat, currentLng, nextLat, nextLng);
+			if (
+				distance >= MIN_CONTROL_DISTANCE &&
+				isValidLocation(map, nextLat, nextLng) &&
+				!createsRouteOverlap(routePoints, candidatePoint)
+			) {
 				controlPoints.push({
 					lat: nextLat,
 					lng: nextLng,
@@ -181,42 +296,26 @@ export function generateCourse(
 			}
 		}
 
-		if (!foundValid) {
-			// Fall back to generate point without validation
-			const [nextLat, nextLng] = generateRandomPoint(currentLat, currentLng, maxDistanceMeters);
-			controlPoints.push({
-				lat: nextLat,
-				lng: nextLng,
-				name: `Control ${i + 1}`,
-				index: i + 1
-			});
-			currentLat = nextLat;
-			currentLng = nextLng;
+		if (!foundValid && attempts < maxAttempts - 1) {
+			attempts++;
+			i--; // Retry this control
+			continue;
 		}
 
 		attempts++;
 	}
 
-	// Generate goal point (50m from last control)
-	let goalLat = currentLat;
-	let goalLng = currentLng;
-	let goalAttempts = 0;
-	while (goalAttempts < 20) {
-		[goalLat, goalLng] = generateRandomPoint(currentLat, currentLng, 50);
-		if (isValidLocation(map, goalLat, goalLng)) break;
-		goalAttempts++;
-	}
-
+	// Goal point is at the user's GPS location
 	const goalPoint: ControlPoint = {
-		lat: goalLat,
-		lng: goalLng,
+		lat: userLat,
+		lng: userLng,
 		name: 'Goal',
 		index: numControls + 1
 	};
 
 	// Calculate total distance
 	let totalDistance = 0;
-	let route: [number, number][] = [[startPoint.lat, startPoint.lng]];
+	const route: [number, number][] = [[startPoint.lat, startPoint.lng]];
 
 	for (const control of controlPoints) {
 		const dist = getDistance(route[route.length - 1][0], route[route.length - 1][1], control.lat, control.lng);

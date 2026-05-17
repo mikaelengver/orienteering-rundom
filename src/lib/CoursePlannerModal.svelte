@@ -22,11 +22,14 @@
 </script>
 
 {#if isOpen}
-	<div class="modal-overlay" role="dialog" onmousedown={closeModal} onkeydown={(e) => e.key === 'Escape' && closeModal()}>
-		<div 
-			class="modal-content" 
-			onmousedown={(e) => e.stopPropagation()}
-			onclick={(e) => e.stopPropagation()}
+	<div class="modal-overlay">
+		<button class="modal-backdrop" type="button" aria-label="Close modal" onclick={closeModal}></button>
+		<div
+			class="modal-content"
+			role="dialog"
+			aria-modal="true"
+			tabindex="-1"
+			onkeydown={(e) => e.key === 'Escape' && closeModal()}
 		>
 			<div class="modal-header">
 				<h2>Plan Your Orienteering Course</h2>
@@ -89,7 +92,19 @@
 		z-index: 1000;
 	}
 
+	.modal-backdrop {
+		position: absolute;
+		inset: 0;
+		background: transparent;
+		border: none;
+		padding: 0;
+		margin: 0;
+		cursor: default;
+	}
+
 	.modal-content {
+		position: relative;
+		z-index: 1;
 		background: white;
 		border-radius: 12px;
 		box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
@@ -155,6 +170,7 @@
 		border-radius: 3px;
 		background: #d1d5db;
 		outline: none;
+		appearance: none;
 		-webkit-appearance: none;
 	}
 

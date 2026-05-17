@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
+	import type { Circle, CircleMarker, Layer, LeafletEvent, Map as LeafletMap } from 'leaflet';
 	import locationSvg from '$lib/assets/location-crosshairs-solid-full.svg?raw';
 	import CoursePlannerModal from '$lib/CoursePlannerModal.svelte';
 	import { generateCourse, isNearControl, type OrienteeringCourse } from '$lib/courseGenerator';
@@ -8,7 +10,7 @@
 	let error: string | null = $state(null);
 	let plannerModal: CoursePlannerModal | undefined;
 	let activeCourse: OrienteeringCourse | null = $state(null);
-	let foundControls: Set<number> = $state(new Set());
+	let foundControls: SvelteSet<number> = new SvelteSet<number>();
 	let userPosition: { lat: number; lng: number } | null = $state(null);
 
 
@@ -38,12 +40,83 @@
 	const LOCATION_MAX_AGE_MS = 5000;
 	const LOCATION_TIMEOUT_MS = 10000;
 
-	let map: any = null;
+	let map!: LeafletMap;
+	let isMapReady = false;
 	let drawCourse: (course: OrienteeringCourse) => void = () => {};
+	let drawnCourseLayers: Layer[] = [];
+
+	type SerializedCourse = {
+		v: 1;
+		startPoint: OrienteeringCourse['startPoint'];
+		controls: OrienteeringCourse['controls'];
+		goalPoint: OrienteeringCourse['goalPoint'];
+		totalDistance: number;
+		route: [number, number][];
+	};
+
+	function serializeCourse(course: OrienteeringCourse): string {
+		const payload: SerializedCourse = {
+			v: 1,
+			startPoint: course.startPoint,
+			controls: course.controls,
+			goalPoint: course.goalPoint,
+			totalDistance: course.totalDistance,
+			route: course.route
+		};
+		const base64 = btoa(JSON.stringify(payload));
+		return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+	}
+
+	function deserializeCourse(serialized: string): OrienteeringCourse | null {
+		try {
+			const padded = serialized + '==='.slice((serialized.length + 3) % 4);
+			const base64 = padded.replace(/-/g, '+').replace(/_/g, '/');
+			const parsed = JSON.parse(atob(base64)) as Partial<SerializedCourse>;
+
+			if (
+				parsed.v !== 1 ||
+				!parsed.startPoint ||
+				!Array.isArray(parsed.controls) ||
+				!parsed.goalPoint ||
+				typeof parsed.totalDistance !== 'number' ||
+				!Array.isArray(parsed.route)
+			) {
+				return null;
+			}
+
+			return {
+				startPoint: parsed.startPoint,
+				controls: parsed.controls,
+				goalPoint: parsed.goalPoint,
+				totalDistance: parsed.totalDistance,
+				route: parsed.route as [number, number][]
+			};
+		} catch {
+			return null;
+		}
+	}
+
+	function updateCourseInUrl(course: OrienteeringCourse): void {
+		const url = new URL(window.location.href);
+		url.searchParams.set('course', serializeCourse(course));
+		window.history.replaceState({}, '', url);
+	}
+
+	function loadCourseFromUrl(): OrienteeringCourse | null {
+		const url = new URL(window.location.href);
+		const serialized = url.searchParams.get('course');
+		if (!serialized) return null;
+		return deserializeCourse(serialized);
+	}
 
 	// Handle plan event from modal - move outside onMount
-	function handlePlanCourse(event: any) {
-		const detail = event.detail || event;
+	function handlePlanCourse(event: CustomEvent<{ kilometers: number; controls: number }>) {
+		if (!isMapReady) {
+			error = 'Map is not ready yet.';
+			return;
+		}
+
+		const detail = event.detail;
 		const { kilometers, controls } = detail;
 
 		if (!userPosition) {
@@ -53,18 +126,23 @@
 
 		try {
 			activeCourse = generateCourse(map, userPosition.lat, userPosition.lng, kilometers, controls);
-			foundControls = new Set();
+			foundControls = new SvelteSet<number>();
 			drawCourse(activeCourse);
+			updateCourseInUrl(activeCourse);
 			error = null;
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Failed to generate course';
 		}
 	}
 
-	onMount(async () => {
-		if (!mapContainer) return;
+	onMount(() => {
+		let locationWatchId: number | null = null;
+		let mountedMap: LeafletMap | null = null;
 
-		try {
+		const initializeMap = async () => {
+			if (!mapContainer) return;
+
+			try {
 			// Dynamically import Leaflet
 			const leaflet = await import('leaflet');
 			const L = leaflet.default;
@@ -74,14 +152,23 @@
 			const proj4 = proj4Module.default;
 
 			// Set globals for proj4leaflet
-			(window as any).L = L;
-			(window as any).proj4 = proj4;
+			const projWindow = window as Window & { L?: typeof L; proj4?: typeof proj4 };
+			projWindow.L = L;
+			projWindow.proj4 = proj4;
 
 			// Import proj4leaflet
 			await import('proj4leaflet');
 
 			// Get the extended L with Proj
-			const LWithProj = L as any;
+			const LWithProj = L as typeof L & {
+				Proj?: {
+					CRS: new (
+						code: string,
+						proj4def: string,
+						options: { resolutions: number[]; origin: [number, number] }
+					) => LeafletMap['options']['crs'];
+				};
+			};
 
 			// Create GoKartor CRS if proj4leaflet is available
 			let goKartorCrs = null;
@@ -105,8 +192,11 @@
 				zoomControl: true,
 				minZoom: 4,
 				maxZoom: initialMaxZoom,
-				crs: initialCrs
+				crs: initialCrs,
+				zoomAnimation: false,
+				markerZoomAnimation: false
 			}).setView([59.2754, 17.9819], 12);
+			isMapReady = true;
 
 			let usingGoKartorCrs = !!goKartorCrs;
 			if (usingGoKartorCrs) {
@@ -157,11 +247,11 @@
 			layerControl.addTo(map);
 
 			// Location tracking state
-			let locationWatchId: number | null = null;
-			let userLocationMarker: any = null;
-			let userAccuracyCircle: any = null;
+			let userLocationMarker: CircleMarker | null = null;
+			let userAccuracyCircle: Circle | null = null;
 			let isLocationTrackingActive = false;
 			let locationButton: HTMLButtonElement | null = null;
+			mountedMap = map;
 
 			const updateUserPosition = (position: GeolocationPosition) => {
 				const { latitude, longitude, accuracy } = position.coords;
@@ -238,11 +328,19 @@
 						locationWatchId = null;
 					}
 					if (userLocationMarker) {
-						try { map.removeLayer(userLocationMarker); } catch {}
+						try {
+							map.removeLayer(userLocationMarker);
+						} catch {
+							// Ignore if marker has already been removed
+						}
 						userLocationMarker = null;
 					}
 					if (userAccuracyCircle) {
-						try { map.removeLayer(userAccuracyCircle); } catch {}
+						try {
+							map.removeLayer(userAccuracyCircle);
+						} catch {
+							// Ignore if circle has already been removed
+						}
 						userAccuracyCircle = null;
 					}
 				};
@@ -319,59 +417,57 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 					};
 
 					// Check proximity to controls
-					if (activeCourse && userPosition) {
-						const checkProximity = () => {
-							// Check start point
-							if (
-								!foundControls.has(0) &&
-								isNearControl(
-									userPosition.lat,
-									userPosition.lng,
-									activeCourse.startPoint.lat,
-									activeCourse.startPoint.lng,
-									20
-								)
-							) {
-								foundControls.add(0);
-								playCheckpointSound();
-							}
+					const currentCourse = activeCourse;
+					const currentPosition = userPosition;
+					if (!currentCourse || !currentPosition) return;
 
-							// Check controls
-							for (const control of activeCourse.controls) {
-								if (
-									!foundControls.has(control.index) &&
-									isNearControl(
-										userPosition.lat,
-										userPosition.lng,
-										control.lat,
-										control.lng,
-										20
-									)
-								) {
-									foundControls.add(control.index);
-									playCheckpointSound();
-								}
-							}
+					// Check start point
+					if (
+						!foundControls.has(0) &&
+						isNearControl(
+							currentPosition.lat,
+							currentPosition.lng,
+							currentCourse.startPoint.lat,
+							currentCourse.startPoint.lng,
+							20
+						)
+					) {
+						foundControls.add(0);
+						playCheckpointSound();
+					}
 
-							// Check goal
-							const goalIndex = activeCourse.goalPoint.index;
-							if (
-								!foundControls.has(goalIndex) &&
-								isNearControl(
-									userPosition.lat,
-									userPosition.lng,
-									activeCourse.goalPoint.lat,
-									activeCourse.goalPoint.lng,
-									20
-								)
-							) {
-								foundControls.add(goalIndex);
-								playCheckpointSound();
-								error = 'Course completed! 🎉';
-							}
-						};
+					// Check controls
+					for (const control of currentCourse.controls) {
+						if (
+							!foundControls.has(control.index) &&
+							isNearControl(
+								currentPosition.lat,
+								currentPosition.lng,
+								control.lat,
+								control.lng,
+								20
+							)
+						) {
+							foundControls.add(control.index);
+							playCheckpointSound();
+						}
+					}
 
-						checkProximity();
+					// Check goal
+					const goalIndex = currentCourse.goalPoint.index;
+					if (
+						!foundControls.has(goalIndex) &&
+						isNearControl(
+							currentPosition.lat,
+							currentPosition.lng,
+							currentCourse.goalPoint.lat,
+							currentCourse.goalPoint.lng,
+							20
+						)
+					) {
+						foundControls.add(goalIndex);
+						playCheckpointSound();
+						error = 'Course completed! 🎉';
 					}
 				});
 			}
@@ -380,7 +476,7 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 
 
 			// Handle layer switching
-			map.on('baselayerchange', (event: any) => {
+			map.on('baselayerchange', (event: LeafletEvent & { layer: Layer }) => {
 				const currentZoom = map.getZoom();
 				const center = map.getCenter();
 
@@ -405,7 +501,12 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 
 			// Play checkpoint found sound
 			function playCheckpointSound() {
-				const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+				const AudioContextCtor = window.AudioContext || (window as Window & {
+					webkitAudioContext?: typeof AudioContext;
+				}).webkitAudioContext;
+				if (!AudioContextCtor) return;
+
+				const audioContext = new AudioContextCtor();
 				const now = audioContext.currentTime;
 
 				// Create a beeping sound
@@ -427,82 +528,134 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 
 			// Draw course on map
 			const drawCourseImpl = (course: OrienteeringCourse) => {
-				// Remove existing course layers
-				map.eachLayer((layer: any) => {
-					if (layer instanceof L.Marker && (layer.options.className as string)?.includes('course')) {
+				// Remove previously drawn course layers only
+				for (const layer of drawnCourseLayers) {
+					if (map.hasLayer(layer)) {
 						map.removeLayer(layer);
 					}
-					if (layer instanceof L.Polyline && (layer.options.className as string)?.includes('course-route')) {
-						map.removeLayer(layer);
-					}
-				});
+				}
+				drawnCourseLayers = [];
 
 				// Draw route line
 				const routeLine = L.polyline(course.route, {
-					color: '#f59e0b',
-					weight: 3,
-					opacity: 0.7,
-					dashArray: '5, 5',
+					color: '#ec4899',
+					weight: 6,
+					opacity: 0.9,
+					dashArray: '',
 					className: 'course-route'
 				});
 				routeLine.addTo(map);
+				drawnCourseLayers.push(routeLine);
 
-				// Draw start point
-				const startMarker = L.circleMarker([course.startPoint.lat, course.startPoint.lng], {
-					radius: 8,
-					color: '#10b981',
-					fillColor: '#d1fae5',
-					fillOpacity: 0.9,
-					weight: 2,
-					className: 'course-marker'
+				// Draw start point as an outlined equilateral triangle icon
+				const startIcon = L.divIcon({
+					className: 'course-start-icon',
+					html: '<svg viewBox="0 0 100 87" width="32" height="29" aria-hidden="true"><polygon points="50,4 96,83 4,83" fill="none" stroke="#ec4899" stroke-width="10" stroke-linejoin="round"/></svg>',
+					iconSize: [32, 29],
+					iconAnchor: [16, 14]
+				});
+				const startMarker = L.marker([course.startPoint.lat, course.startPoint.lng], {
+					icon: startIcon,
+					interactive: false,
+					keyboard: false
 				});
 				startMarker.bindPopup('Start');
 				startMarker.addTo(map);
+				drawnCourseLayers.push(startMarker);
 
 				// Draw control points
 				for (const control of course.controls) {
 					const isFound = foundControls.has(control.index);
 					const marker = L.circleMarker([control.lat, control.lng], {
-						radius: 6,
-						color: isFound ? '#059669' : '#3b82f6',
-						fillColor: isFound ? '#10b981' : '#93c5fd',
-						fillOpacity: 0.9,
-						weight: 2,
-						className: 'course-marker'
+						radius: 12,
+						color: '#ec4899',
+						fillColor: 'transparent',
+						fillOpacity: 0,
+						weight: 3,
+						className: 'course-marker',
+						interactive: false,
+						bubblingMouseEvents: false
 					});
 					marker.bindPopup(`${control.name}${isFound ? ' ✓' : ''}`);
+					marker.bindTooltip(String(control.index), {
+						permanent: true,
+						direction: 'right',
+						offset: [18, 0],
+						className: 'course-control-label',
+						interactive: false
+					});
 					marker.addTo(map);
+					drawnCourseLayers.push(marker);
 				}
 
-				// Draw goal point
-				const goalMarker = L.circleMarker([course.goalPoint.lat, course.goalPoint.lng], {
-					radius: 8,
-					color: foundControls.has(course.goalPoint.index) ? '#8b5cf6' : '#dc2626',
-					fillColor: foundControls.has(course.goalPoint.index) ? '#ede9fe' : '#fecaca',
-					fillOpacity: 0.9,
-					weight: 2,
-					className: 'course-marker'
+				// Draw goal point as double circle
+				const outerCircle = L.circleMarker([course.goalPoint.lat, course.goalPoint.lng], {
+					radius: 20,
+					color: '#ec4899',
+					fillColor: 'transparent',
+					fillOpacity: 0,
+					weight: 3,
+					className: 'course-marker',
+					interactive: false,
+					bubblingMouseEvents: false
 				});
-				goalMarker.bindPopup('Goal');
-				goalMarker.addTo(map);
+				outerCircle.bindPopup('Goal');
+				outerCircle.addTo(map);
+				drawnCourseLayers.push(outerCircle);
+
+				const innerCircle = L.circleMarker([course.goalPoint.lat, course.goalPoint.lng], {
+					radius: 10,
+					color: '#ec4899',
+					fillColor: '#ec4899',
+					fillOpacity: foundControls.has(course.goalPoint.index) ? 0.5 : 0.9,
+					weight: 3,
+					className: 'course-marker',
+					interactive: false,
+					bubblingMouseEvents: false
+				});
+				innerCircle.bindPopup('Goal');
+				innerCircle.addTo(map);
+				drawnCourseLayers.push(innerCircle);
 			};
 
 			// Assign drawCourse to outer scope
 			drawCourse = drawCourseImpl;
 
+			// Keep control rendering locked to map coordinates after map movements
+			map.on('zoomend moveend', () => {
+				if (activeCourse) {
+					drawCourse(activeCourse);
+				}
+			});
+
+			// Load and draw a shared course from URL if present
+			const sharedCourse = loadCourseFromUrl();
+			if (sharedCourse) {
+				activeCourse = sharedCourse;
+				foundControls = new SvelteSet<number>();
+				drawCourse(sharedCourse);
+			}
+
 			// Setup location tracking
 			setupLocationTracking();
 
-			return () => {
-				if (locationWatchId !== null) {
-					navigator.geolocation.clearWatch(locationWatchId);
-				}
-				map.remove();
-			};
-		} catch (err) {
-			error = err instanceof Error ? err.message : 'An unknown error occurred';
-			console.error('Map initialization error:', err);
-		}
+			} catch (err) {
+				error = err instanceof Error ? err.message : 'An unknown error occurred';
+				console.error('Map initialization error:', err);
+			}
+		};
+
+		void initializeMap();
+
+		return () => {
+			if (locationWatchId !== null) {
+				navigator.geolocation.clearWatch(locationWatchId);
+			}
+			if (mountedMap) {
+				mountedMap.remove();
+				isMapReady = false;
+			}
+		};
 	});
 </script>
 
@@ -605,6 +758,22 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 	:global(.map-planner-button svg) {
 		width: 18px;
 		height: 18px;
+	}
+
+	:global(.leaflet-tooltip.course-control-label) {
+		background: transparent;
+		border: none;
+		box-shadow: none;
+		color: #ec4899;
+		font-size: 20px;
+		font-weight: 700;
+		padding: 0;
+		line-height: 1;
+		text-shadow: 0 0 2px #ffffff, 0 0 6px #ffffff;
+	}
+
+	:global(.leaflet-tooltip.course-control-label::before) {
+		display: none;
 	}
 </style>
 
