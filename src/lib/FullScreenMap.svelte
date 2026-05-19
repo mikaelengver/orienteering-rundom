@@ -99,7 +99,9 @@
 	const LOCATION_TIMEOUT_MS = 10000;
 	const TRAIL_LOG_INTERVAL_MS = 3000; // Log position every 3 seconds
 	const OMAPS_REFRESH_DEBOUNCE_MS = 160;
-	const OMAPS_HIGHRES_MIN_ZOOM = 15;
+	// High-res Omaps overlays kick in at zoom 14 because the GoKartor background
+	// (used under the Omaps layer) tops out at native zoom 14 in EPSG:3006.
+	const OMAPS_HIGHRES_MIN_ZOOM = 14;
 	const OMAPS_MAX_VISIBLE_OVERLAYS = 12;
 	const OMAPS_LOWRES_OPACITY = 0.5;
 	const OMAPS_HIGHRES_OPACITY = 1;
@@ -686,9 +688,15 @@ ${trkpts}
 				maxZoom: 14
 			});
 
-			const omapsBackgroundLayer = L.tileLayer(MAP_CONFIGS.osm.url, {
-				attribution: MAP_CONFIGS.osm.attribution,
-				maxZoom: 19
+			// Use GoKartor tiles as the background for the Omaps composite layer.
+			// Requires the GoKartor (EPSG:3006) CRS to be active so tiles align — the
+			// baselayerchange handler below switches the map CRS accordingly. We allow
+			// scaling tiles one zoom level beyond native (maxNativeZoom 14 → maxZoom 15)
+			// so high-res Omaps overlays still render crisply at zoom 15.
+			const omapsBackgroundLayer = L.tileLayer(MAP_CONFIGS.gokartor.url, {
+				attribution: MAP_CONFIGS.gokartor.attribution,
+				maxNativeZoom: 14,
+				maxZoom: 15
 			});
 			const omapsOverlayGroup = L.layerGroup();
 			const omapsCompositeLayer = L.layerGroup([omapsBackgroundLayer, omapsOverlayGroup]);
@@ -1203,15 +1211,25 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 			map.on('baselayerchange', (event: LeafletEvent & { layer: Layer }) => {
 				const currentZoom = map.getZoom();
 				const center = map.getCenter();
-				const nextLayerUsesGoKartorProjection = event.layer === goKartorLayer;
+				// Both the GoKartor base layer and the Omaps composite (which now uses
+				// GoKartor tiles as its background) require the GoKartor EPSG:3006 CRS.
+				const nextLayerUsesGoKartorProjection =
+					event.layer === goKartorLayer || event.layer === omapsCompositeLayer;
+				// Allow one extra zoom level (15) when the Omaps layer is active so
+				// high-res orienteering map overlays can render past the GoKartor tile
+				// native max of 14.
+				const nextMaxZoom = event.layer === omapsCompositeLayer ? 15 : 14;
 
 				if (nextLayerUsesGoKartorProjection && !usingGoKartorCrs && goKartorCrs) {
-					const nextZoom = Math.max(6, Math.min(15, currentZoom - 3));
+					const nextZoom = Math.max(6, Math.min(nextMaxZoom, currentZoom - 3));
 					map.options.crs = goKartorCrs;
 					map.setView(center, nextZoom, { animate: false });
 					map.invalidateSize(false);
-					map.setMaxZoom(14);
+					map.setMaxZoom(nextMaxZoom);
 					usingGoKartorCrs = true;
+				} else if (nextLayerUsesGoKartorProjection && usingGoKartorCrs) {
+					// Already in GoKartor CRS — just adjust max zoom for the new layer.
+					map.setMaxZoom(nextMaxZoom);
 				} else if (nextLayerUsesGoKartorProjection && !goKartorCrs) {
 					error = 'GoKartor displayed without projection (Proj4Leaflet not available).';
 				} else if (usingGoKartorCrs && !nextLayerUsesGoKartorProjection) {
