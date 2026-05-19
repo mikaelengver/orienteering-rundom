@@ -39,6 +39,23 @@
 		east: number;
 	};
 
+	type OMapsMapDetail = {
+		id: number;
+		url: string;
+		width: number;
+		height: number;
+		topClipping: number;
+		bottomClipping: number;
+		leftClipping: number;
+		rightClipping: number;
+		center?: { latitude: number; longitude: number };
+		projection?: { epsgCode: number; matrix: number[][] };
+		defaultProjection?: {
+			origin: { latitude: number; longitude: number };
+			matrix: number[][];
+		};
+	};
+
 	let mapContainer: HTMLDivElement | undefined;
 	let error: string | null = $state(null);
 	let plannerModal: CoursePlannerModal | undefined;
@@ -359,6 +376,124 @@ ${trkpts}
 		return !(a.east < b.west || a.west > b.east || a.north < b.south || a.south > b.north);
 	}
 
+	function getOmapsAxisAlignedBounds(
+		polygon: OMapsPolygon
+	): [[number, number], [number, number]] {
+		return [
+			[polygon.south, polygon.west],
+			[polygon.north, polygon.east]
+		];
+	}
+
+	/**
+	 * Compute georeferenced corners for an Omaps image using its projection metadata.
+	 *
+	 * Omaps stores a 3x3 affine matrix `M` in `defaultProjection.matrix` that maps
+	 * projected coordinates (X, Y in meters, relative to `defaultProjection.origin`)
+	 * to pixel coordinates of the source image:
+	 *     [px, py, 1]^T = M · [X, Y, 1]^T
+	 * i.e.  px = a*X + b*Y + tx,   py = c*X + d*Y + ty.
+	 *
+	 * We invert this to map clipped image corner pixels back to projected meters,
+	 * then convert meters → lat/lng using a flat-earth tangent-plane approximation
+	 * at the projection origin (sub-meter accurate for typical orienteering maps).
+	 *
+	 * Returns top-left, top-right, and bottom-left lat/lng corners (the order
+	 * required by `L.imageOverlay.rotated`), or `null` if the metadata is missing
+	 * or degenerate.
+	 */
+	function getOmapsRotatedCorners(
+		detail: OMapsMapDetail
+	): { topLeft: [number, number]; topRight: [number, number]; bottomLeft: [number, number] } | null {
+		const defaultProjection = detail.defaultProjection;
+		if (!defaultProjection) return null;
+
+		const matrix = defaultProjection.matrix;
+		const origin = defaultProjection.origin;
+		if (
+			!Array.isArray(matrix)
+			|| matrix.length < 2
+			|| !Array.isArray(matrix[0])
+			|| !Array.isArray(matrix[1])
+			|| matrix[0].length < 3
+			|| matrix[1].length < 3
+		) {
+			return null;
+		}
+		if (!Number.isFinite(origin.latitude) || !Number.isFinite(origin.longitude)) {
+			return null;
+		}
+
+		const a = matrix[0][0];
+		const b = matrix[0][1];
+		const tx = matrix[0][2];
+		const c = matrix[1][0];
+		const d = matrix[1][1];
+		const ty = matrix[1][2];
+
+		const det = a * d - b * c;
+		if (!Number.isFinite(det) || Math.abs(det) < 1e-12) return null;
+
+		const width = detail.width;
+		const height = detail.height;
+		if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+			return null;
+		}
+
+		const left = Math.max(0, detail.leftClipping);
+		const right = Math.max(0, detail.rightClipping);
+		const top = Math.max(0, detail.topClipping);
+		const bottom = Math.max(0, detail.bottomClipping);
+
+		// Clipped image corner pixel coordinates (top-left origin, y-down).
+		const cornerPx = {
+			topLeft: [left, top],
+			topRight: [width - right, top],
+			bottomLeft: [left, height - bottom]
+		} as const;
+
+		// Inverse affine: projected (X, Y) from pixel (px, py).
+		const pixelToProjected = (px: number, py: number): [number, number] => {
+			const dx = px - tx;
+			const dy = py - ty;
+			const X = (d * dx - b * dy) / det;
+			const Y = (-c * dx + a * dy) / det;
+			return [X, Y];
+		};
+
+		// Flat-earth conversion from projected meters (relative to origin) to lat/lng.
+		// Omaps' default projection is a local tangent plane at `origin`, units in metres.
+		const METERS_PER_DEG_LAT = 111320;
+		const cosLat = Math.cos((origin.latitude * Math.PI) / 180);
+		const metersPerDegLng = METERS_PER_DEG_LAT * cosLat;
+		if (metersPerDegLng <= 0 || !Number.isFinite(metersPerDegLng)) return null;
+
+		const projectedToLatLng = (X: number, Y: number): [number, number] => {
+			const lat = origin.latitude + Y / METERS_PER_DEG_LAT;
+			const lng = origin.longitude + X / metersPerDegLng;
+			return [lat, lng];
+		};
+
+		const toCorner = ([px, py]: readonly [number, number]): [number, number] => {
+			const [X, Y] = pixelToProjected(px, py);
+			return projectedToLatLng(X, Y);
+		};
+
+		const topLeft = toCorner(cornerPx.topLeft);
+		const topRight = toCorner(cornerPx.topRight);
+		const bottomLeft = toCorner(cornerPx.bottomLeft);
+
+		if (
+			!Number.isFinite(topLeft[0]) || !Number.isFinite(topLeft[1])
+			|| !Number.isFinite(topRight[0]) || !Number.isFinite(topRight[1])
+			|| !Number.isFinite(bottomLeft[0]) || !Number.isFinite(bottomLeft[1])
+		) {
+			return null;
+		}
+
+		return { topLeft, topRight, bottomLeft };
+	}
+
 	onMount(() => {
 		let locationWatchId: number | null = null;
 		let mountedMap: LeafletMap | null = null;
@@ -372,6 +507,9 @@ ${trkpts}
 			// Dynamically import Leaflet
 			const leaflet = await import('leaflet');
 			const L = leaflet.default;
+			// Side-effect import: registers L.imageOverlay.rotated for georeferenced
+			// rotated image overlays (used for high-res Omaps images).
+			await import('leaflet-imageoverlay-rotated');
 
 			const clearControlEditMarker = () => {
 				if (controlEditMarker) {
@@ -506,8 +644,11 @@ ${trkpts}
 			let isOmapsLayerActive = false;
 			let omapsPolygons: OMapsPolygon[] | null = null;
 			let omapsPolygonsRequest: Promise<OMapsPolygon[]> | null = null;
+			const omapsDetailsById = new SvelteMap<number, OMapsMapDetail | null>();
+			const omapsDetailRequestsById = new SvelteMap<number, Promise<OMapsMapDetail | null>>();
 			const omapsOverlaysById = new SvelteMap<number, ImageOverlay>();
 			const omapsOverlayUrls = new SvelteMap<number, string>();
+			const omapsOverlayKinds = new SvelteMap<number, 'rotated' | 'axis'>();
 
 			// Initialize map centered on the requested location in Älvsjö
 			map = L.map(mapContainer, {
@@ -570,10 +711,96 @@ ${trkpts}
 				}
 				omapsOverlaysById.clear();
 				omapsOverlayUrls.clear();
+				omapsOverlayKinds.clear();
+				omapsDetailsById.clear();
+				omapsDetailRequestsById.clear();
 				if (omapsRefreshTimeout) {
 					clearTimeout(omapsRefreshTimeout);
 					omapsRefreshTimeout = null;
 				}
+			};
+
+			const loadOmapsMapDetail = async (mapId: number): Promise<OMapsMapDetail | null> => {
+				if (omapsDetailsById.has(mapId)) {
+					return omapsDetailsById.get(mapId) ?? null;
+				}
+
+				const pending = omapsDetailRequestsById.get(mapId);
+				if (pending) {
+					return pending;
+				}
+
+				const request = (async () => {
+					try {
+						const response = await fetch(`/api/omaps/map/${mapId}`);
+						if (!response.ok) return null;
+
+						const payload = (await response.json()) as Record<string, unknown>;
+						const projectionSource = payload.projection;
+						const defaultProjectionSource = payload.defaultProjection;
+						const centerSource = payload.center;
+						const detail: OMapsMapDetail = {
+							id: Number(payload.id),
+							url: String(payload.url ?? ''),
+							width: Number(payload.width ?? 0),
+							height: Number(payload.height ?? 0),
+							topClipping: Number(payload.topClipping ?? 0),
+							bottomClipping: Number(payload.bottomClipping ?? 0),
+							leftClipping: Number(payload.leftClipping ?? 0),
+							rightClipping: Number(payload.rightClipping ?? 0),
+							center:
+								centerSource && typeof centerSource === 'object'
+									? {
+										latitude: Number((centerSource as Record<string, unknown>).latitude),
+										longitude: Number((centerSource as Record<string, unknown>).longitude)
+									}
+									: undefined,
+							projection:
+								projectionSource && typeof projectionSource === 'object'
+									? {
+										epsgCode: Number((projectionSource as Record<string, unknown>).epsgCode),
+										matrix: Array.isArray((projectionSource as Record<string, unknown>).matrix)
+											? ((projectionSource as Record<string, unknown>).matrix as number[][])
+											: []
+									}
+									: undefined,
+							defaultProjection:
+								defaultProjectionSource && typeof defaultProjectionSource === 'object'
+									? {
+										origin: {
+											latitude: Number(
+												((defaultProjectionSource as Record<string, unknown>).origin as Record<string, unknown>)
+													?.latitude
+											),
+											longitude: Number(
+												((defaultProjectionSource as Record<string, unknown>).origin as Record<string, unknown>)
+													?.longitude
+											)
+										},
+										matrix: Array.isArray((defaultProjectionSource as Record<string, unknown>).matrix)
+											? ((defaultProjectionSource as Record<string, unknown>).matrix as number[][])
+											: []
+									}
+									: undefined
+						};
+
+						if (!Number.isFinite(detail.id) || detail.id !== mapId || detail.url.length === 0) {
+							omapsDetailsById.set(mapId, null);
+							return null;
+						}
+
+						omapsDetailsById.set(mapId, detail);
+						return detail;
+					} catch {
+						omapsDetailsById.set(mapId, null);
+						return null;
+					}
+				})().finally(() => {
+					omapsDetailRequestsById.delete(mapId);
+				});
+
+				omapsDetailRequestsById.set(mapId, request);
+				return request;
 			};
 
 			const loadOmapsPolygons = async (): Promise<OMapsPolygon[]> => {
@@ -642,38 +869,90 @@ ${trkpts}
 						.sort((a, b) => a.area - b.area)
 						.slice(0, OMAPS_MAX_VISIBLE_OVERLAYS);
 
+					const useHighRes = zoom >= OMAPS_HIGHRES_MIN_ZOOM;
+					const detailsById: Record<number, OMapsMapDetail | null> = {};
+					if (useHighRes) {
+						await Promise.all(
+							visiblePolygons.map(async (polygon) => {
+								detailsById[polygon.id] = await loadOmapsMapDetail(polygon.id);
+							})
+						);
+					}
+
 					const visibleIds = new SvelteSet<number>();
 					for (const polygon of visiblePolygons) {
 						visibleIds.add(polygon.id);
-						const useHighRes = zoom >= OMAPS_HIGHRES_MIN_ZOOM;
+						const detail = useHighRes ? (detailsById[polygon.id] ?? null) : null;
 						const imageUrl =
 							useHighRes
-								? `${OMAPS_HIGHRES_IMAGE_BASE_URL}/${polygon.id}`
+								? (detail?.url ?? `${OMAPS_HIGHRES_IMAGE_BASE_URL}/${polygon.id}`)
 								: polygon.largeThumbnailUrl;
-						const imageBounds = L.latLngBounds(
-							[polygon.south, polygon.west],
-							[polygon.north, polygon.east]
-						);
+						const opacity = useHighRes ? OMAPS_HIGHRES_OPACITY : OMAPS_LOWRES_OPACITY;
 
-						const existing = omapsOverlaysById.get(polygon.id);
+						// Prefer projection-matrix-based rotated georeferencing when metadata is
+						// available. Falls back to axis-aligned bounds (polygon bbox) otherwise.
+						const corners = useHighRes && detail ? getOmapsRotatedCorners(detail) : null;
+						const kind: 'rotated' | 'axis' = corners ? 'rotated' : 'axis';
+
+						let existing = omapsOverlaysById.get(polygon.id);
+						// Overlay kind changed (rotated <-> axis) — recreate from scratch.
+						if (existing && omapsOverlayKinds.get(polygon.id) !== kind) {
+							omapsOverlayGroup.removeLayer(existing);
+							omapsOverlaysById.delete(polygon.id);
+							omapsOverlayUrls.delete(polygon.id);
+							omapsOverlayKinds.delete(polygon.id);
+							existing = undefined;
+						}
+
 						if (existing) {
 							if (omapsOverlayUrls.get(polygon.id) !== imageUrl) {
 								existing.setUrl(imageUrl);
 								omapsOverlayUrls.set(polygon.id, imageUrl);
 							}
-							existing.setBounds(imageBounds);
-							existing.setOpacity(useHighRes ? OMAPS_HIGHRES_OPACITY : OMAPS_LOWRES_OPACITY);
+							if (kind === 'rotated' && corners) {
+								(existing as unknown as {
+									reposition: (
+										tl: [number, number],
+										tr: [number, number],
+										bl: [number, number]
+									) => void;
+								}).reposition(corners.topLeft, corners.topRight, corners.bottomLeft);
+							} else {
+								existing.setBounds(L.latLngBounds(...getOmapsAxisAlignedBounds(polygon)));
+							}
+							existing.setOpacity(opacity);
 							continue;
 						}
 
-						const overlay = L.imageOverlay(imageUrl, imageBounds, {
-							opacity: useHighRes ? OMAPS_HIGHRES_OPACITY : OMAPS_LOWRES_OPACITY,
-							interactive: false,
-							className: 'omaps-image-overlay'
-						});
+						let overlay: ImageOverlay;
+						if (kind === 'rotated' && corners) {
+							overlay = (
+								L.imageOverlay as unknown as {
+									rotated: (
+										url: string,
+										tl: [number, number],
+										tr: [number, number],
+										bl: [number, number],
+										opts: L.ImageOverlayOptions
+									) => ImageOverlay;
+								}
+							).rotated(imageUrl, corners.topLeft, corners.topRight, corners.bottomLeft, {
+								opacity,
+								interactive: false,
+								className: 'omaps-image-overlay'
+							});
+						} else {
+							const bounds = L.latLngBounds(...getOmapsAxisAlignedBounds(polygon));
+							overlay = L.imageOverlay(imageUrl, bounds, {
+								opacity,
+								interactive: false,
+								className: 'omaps-image-overlay'
+							});
+						}
 						overlay.addTo(omapsOverlayGroup);
 						omapsOverlaysById.set(polygon.id, overlay);
 						omapsOverlayUrls.set(polygon.id, imageUrl);
+						omapsOverlayKinds.set(polygon.id, kind);
 					}
 
 					for (const [id, overlay] of omapsOverlaysById) {
@@ -681,6 +960,7 @@ ${trkpts}
 						omapsOverlayGroup.removeLayer(overlay);
 						omapsOverlaysById.delete(id);
 						omapsOverlayUrls.delete(id);
+						omapsOverlayKinds.delete(id);
 					}
 				} catch {
 					if (!error) {
@@ -1303,6 +1583,18 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 		box-shadow: 0 1px 5px rgba(0, 0, 0, 0.65);
 	}
 
+	:global(.leaflet-control-layers label) {
+		padding: 6px 0;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	:global(.leaflet-control-layers-selector) {
+		width: 20px;
+		height: 20px;
+	}
+
 	:global(.leaflet-bar) {
 		border-radius: 4px;
 		overflow: hidden;
@@ -1322,6 +1614,13 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 
 	:global(.leaflet-bar a:hover) {
 		background-color: #f5f5f5;
+	}
+
+	:global(.leaflet-control-zoom a) {
+		width: 44px !important;
+		height: 44px !important;
+		font-size: 24px !important;
+		line-height: 44px !important;
 	}
 
 	:global(.map-location-button) {
