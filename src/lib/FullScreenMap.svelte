@@ -106,6 +106,7 @@
 	const OMAPS_LOWRES_OPACITY = 0.5;
 	const OMAPS_HIGHRES_OPACITY = 1;
 	const OMAPS_HIGHRES_IMAGE_BASE_URL = 'https://www.omaps.net/se/Home/MapImage';
+	const DOUBLE_TAP_MS = 400;
 
 	let map!: LeafletMap;
 	let isMapReady = false;
@@ -496,6 +497,79 @@ ${trkpts}
 		return { topLeft, topRight, bottomLeft };
 	}
 
+	/**
+	 * Builds a CSS `clip-path: polygon(...)` string in image-pixel coordinates
+	 * for an Omaps polygon shape (the orange outline visible on omaps.net that
+	 * crops away the white border of each map). The polygon vertices arrive as
+	 * lat/lng, and we use the same forward projection (flat-earth tangent plane
+	 * → projection matrix) as `getOmapsRotatedCorners` to map them into the
+	 * image's natural pixel space. `clip-path` is applied to the `<img>` element
+	 * before the rotated-overlay plugin's CSS transform, so the clipped shape is
+	 * carried through the rotation/scaling automatically.
+	 *
+	 * Values are emitted as percentages of `detail.width`/`detail.height` so the
+	 * clip scales correctly regardless of the rendered image's actual pixel
+	 * dimensions — important because the projection matrix is sometimes
+	 * calibrated against the smallest thumbnail size (e.g. 32×24) while the
+	 * MapImage endpoint returns a much larger image.
+	 */
+	function getOmapsPolygonClipPath(
+		detail: OMapsMapDetail,
+		polygonShape: ReadonlyArray<readonly [number, number]>
+	): string | null {
+		if (polygonShape.length < 3) return null;
+		const defaultProjection = detail.defaultProjection;
+		if (!defaultProjection) return null;
+
+		const matrix = defaultProjection.matrix;
+		if (
+			!Array.isArray(matrix)
+			|| matrix.length < 2
+			|| !Array.isArray(matrix[0])
+			|| !Array.isArray(matrix[1])
+			|| matrix[0].length < 3
+			|| matrix[1].length < 3
+		) {
+			return null;
+		}
+
+		const width = detail.width;
+		const height = detail.height;
+		if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+			return null;
+		}
+
+		const a = matrix[0][0];
+		const b = matrix[0][1];
+		const tx = matrix[0][2];
+		const c = matrix[1][0];
+		const d = matrix[1][1];
+		const ty = matrix[1][2];
+
+		const origin = defaultProjection.origin;
+		if (!Number.isFinite(origin.latitude) || !Number.isFinite(origin.longitude)) return null;
+
+		const METERS_PER_DEG_LAT = 111320;
+		const cosLat = Math.cos((origin.latitude * Math.PI) / 180);
+		const metersPerDegLng = METERS_PER_DEG_LAT * cosLat;
+		if (!Number.isFinite(metersPerDegLng) || metersPerDegLng <= 0) return null;
+
+		const parts: string[] = [];
+		for (const [lat, lng] of polygonShape) {
+			if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+			const X = (lng - origin.longitude) * metersPerDegLng;
+			const Y = (lat - origin.latitude) * METERS_PER_DEG_LAT;
+			const px = a * X + b * Y + tx;
+			const py = c * X + d * Y + ty;
+			if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+			const xPct = (px / width) * 100;
+			const yPct = (py / height) * 100;
+			parts.push(`${xPct.toFixed(4)}% ${yPct.toFixed(4)}%`);
+		}
+
+		return `polygon(${parts.join(', ')})`;
+	}
+
 	onMount(() => {
 		let locationWatchId: number | null = null;
 		let mountedMap: LeafletMap | null = null;
@@ -646,6 +720,8 @@ ${trkpts}
 			let isOmapsLayerActive = false;
 			let omapsPolygons: OMapsPolygon[] | null = null;
 			let omapsPolygonsRequest: Promise<OMapsPolygon[]> | null = null;
+			let omapsPolygonShapes: Map<number, Array<[number, number]>> | null = null;
+			let omapsPolygonShapesRequest: Promise<Map<number, Array<[number, number]>>> | null = null;
 			const omapsDetailsById = new SvelteMap<number, OMapsMapDetail | null>();
 			const omapsDetailRequestsById = new SvelteMap<number, Promise<OMapsMapDetail | null>>();
 			const omapsOverlaysById = new SvelteMap<number, ImageOverlay>();
@@ -858,6 +934,64 @@ ${trkpts}
 				return omapsPolygonsRequest;
 			};
 
+			/**
+			 * Fetches the binary `LoadMapPolygons` payload from Omaps and decodes it
+			 * into a map of `id → [[lat, lng], ...]`. This mirrors the orange polygon
+			 * outlines visible on omaps.net (used here to crop the white border of
+			 * each map overlay via CSS `clip-path`). Layout per upstream JS:
+			 *   - 4 bytes (Int32 LE): total map count
+			 *   - per map:
+			 *       - 8 bytes (Int64 LE): map id
+			 *       - 4 bytes (Int32 LE): vertex count
+			 *       - per vertex: 4 bytes lat×1e6 (Int32 LE), 4 bytes lng×1e6 (Int32 LE)
+			 */
+			const loadOmapsPolygonShapes = async (): Promise<Map<number, Array<[number, number]>>> => {
+				if (omapsPolygonShapes) return omapsPolygonShapes;
+				if (omapsPolygonShapesRequest) return omapsPolygonShapesRequest;
+
+				omapsPolygonShapesRequest = (async () => {
+					const response = await fetch('/api/omaps/polygon-shapes');
+					if (!response.ok) {
+						throw new Error(`Omaps polygon-shapes request failed (${response.status})`);
+					}
+					const buffer = await response.arrayBuffer();
+					const view = new DataView(buffer);
+					const result = new Map<number, Array<[number, number]>>();
+					let offset = 0;
+					if (buffer.byteLength < 4) {
+						omapsPolygonShapes = result;
+						return result;
+					}
+					const total = view.getInt32(offset, true);
+					offset += 4;
+					for (let i = 0; i < total; i++) {
+						if (offset + 12 > buffer.byteLength) break;
+						const id = view.getUint32(offset, true);
+						// Upper 32 bits of the Int64 id are unused in practice (all map ids
+						// fit in 32 bits), so skip them.
+						offset += 8;
+						const vertexCount = view.getInt32(offset, true);
+						offset += 4;
+						if (vertexCount < 0 || offset + vertexCount * 8 > buffer.byteLength) break;
+						const verts: Array<[number, number]> = new Array(vertexCount);
+						for (let j = 0; j < vertexCount; j++) {
+							const lat = view.getInt32(offset, true) / 1e6;
+							offset += 4;
+							const lng = view.getInt32(offset, true) / 1e6;
+							offset += 4;
+							verts[j] = [lat, lng];
+						}
+						result.set(id, verts);
+					}
+					omapsPolygonShapes = result;
+					return result;
+				})().finally(() => {
+					omapsPolygonShapesRequest = null;
+				});
+
+				return omapsPolygonShapesRequest;
+			};
+
 			const refreshOmapsOverlays = async () => {
 				if (!isOmapsLayerActive) return;
 
@@ -879,12 +1013,17 @@ ${trkpts}
 
 					const useHighRes = zoom >= OMAPS_HIGHRES_MIN_ZOOM;
 					const detailsById: Record<number, OMapsMapDetail | null> = {};
+					let polygonShapesById: Map<number, Array<[number, number]>> | null = null;
 					if (useHighRes) {
-						await Promise.all(
-							visiblePolygons.map(async (polygon) => {
-								detailsById[polygon.id] = await loadOmapsMapDetail(polygon.id);
-							})
-						);
+						const [, shapes] = await Promise.all([
+							Promise.all(
+								visiblePolygons.map(async (polygon) => {
+									detailsById[polygon.id] = await loadOmapsMapDetail(polygon.id);
+								})
+							),
+							loadOmapsPolygonShapes().catch(() => null)
+						]);
+						polygonShapesById = shapes;
 					}
 
 					const visibleIds = new SvelteSet<number>();
@@ -907,6 +1046,14 @@ ${trkpts}
 						// available. Falls back to axis-aligned bounds (polygon bbox) otherwise.
 						const corners = useHighRes && detail ? getOmapsRotatedCorners(detail) : null;
 						const kind: 'rotated' | 'axis' = corners ? 'rotated' : 'axis';
+						const polygonShape =
+							useHighRes && detail && polygonShapesById
+								? polygonShapesById.get(polygon.id) ?? null
+								: null;
+						const clipPath =
+							kind === 'rotated' && detail && polygonShape
+								? getOmapsPolygonClipPath(detail, polygonShape)
+								: null;
 
 						let existing = omapsOverlaysById.get(polygon.id);
 						// Overlay kind changed (rotated <-> axis) — recreate from scratch.
@@ -935,6 +1082,10 @@ ${trkpts}
 								existing.setBounds(L.latLngBounds(...getOmapsAxisAlignedBounds(polygon)));
 							}
 							existing.setOpacity(opacity);
+							const existingImg = existing.getElement();
+							if (existingImg instanceof HTMLElement) {
+								existingImg.style.clipPath = clipPath ?? '';
+							}
 							continue;
 						}
 
@@ -952,21 +1103,34 @@ ${trkpts}
 								}
 							).rotated(imageUrl, corners.topLeft, corners.topRight, corners.bottomLeft, {
 								opacity,
-								interactive: false,
+								interactive: true,
+								bubblingMouseEvents: false,
 								className: 'omaps-image-overlay'
 							});
 						} else {
 							const bounds = L.latLngBounds(...getOmapsAxisAlignedBounds(polygon));
 							overlay = L.imageOverlay(imageUrl, bounds, {
 								opacity,
-								interactive: false,
+								interactive: true,
+								bubblingMouseEvents: false,
 								className: 'omaps-image-overlay'
 							});
 						}
+						// Tap/click on an Omaps overlay raises it above its siblings so the
+						// user can surface a particular map when several overlap. Course
+						// markers stay above all overlays (marker pane z-index 600 > overlay
+						// pane 400), so they continue to receive clicks first.
+						overlay.on('click', () => {
+							overlay.bringToFront();
+						});
 						overlay.addTo(omapsOverlayGroup);
 						omapsOverlaysById.set(polygon.id, overlay);
 						omapsOverlayUrls.set(polygon.id, imageUrl);
 						omapsOverlayKinds.set(polygon.id, kind);
+						const newImg = overlay.getElement();
+						if (newImg instanceof HTMLElement) {
+							newImg.style.clipPath = clipPath ?? '';
+						}
 					}
 
 					for (const [id, overlay] of omapsOverlaysById) {
@@ -1365,9 +1529,22 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 						interactive: false
 					});
 					marker.addTo(map);
-					marker.on('dblclick', (event) => {
-						L.DomEvent.stop(event);
-						beginControlEdit(control);
+					// Manual double-tap detection. Leaflet's `dblclick` event does not
+					// fire reliably from a touch on a marker (the first tap opens the
+					// bound popup and absorbs the second tap before `dblclick` is
+					// synthesised), so we track timing on `click` instead — works for
+					// both mouse and touch.
+					let lastTapAt = 0;
+					marker.on('click', (event) => {
+						const now = Date.now();
+						if (now - lastTapAt < DOUBLE_TAP_MS) {
+							lastTapAt = 0;
+							L.DomEvent.stop(event);
+							marker.closePopup();
+							beginControlEdit(control);
+						} else {
+							lastTapAt = now;
+						}
 					});
 					drawnCourseLayers.push(marker);
 				}
