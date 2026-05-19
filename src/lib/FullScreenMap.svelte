@@ -883,9 +883,15 @@ ${trkpts}
 					for (const polygon of visiblePolygons) {
 						visibleIds.add(polygon.id);
 						const detail = useHighRes ? (detailsById[polygon.id] ?? null) : null;
+						// For high-res rendering, prefer the MapImage endpoint over the blob `url`
+						// in the metadata. The blob `url` points to the stored image at the
+						// metadata's `width`/`height` (matches the largest thumbnail, e.g. 858×1024)
+						// and looks blurry when zoomed. The MapImage endpoint serves a crisp
+						// full-DPI render at the same pixel dimensions, so the projection matrix
+						// (calibrated against width/height) still applies exactly.
 						const imageUrl =
 							useHighRes
-								? (detail?.url ?? `${OMAPS_HIGHRES_IMAGE_BASE_URL}/${polygon.id}`)
+								? `${OMAPS_HIGHRES_IMAGE_BASE_URL}/${polygon.id}`
 								: polygon.largeThumbnailUrl;
 						const opacity = useHighRes ? OMAPS_HIGHRES_OPACITY : OMAPS_LOWRES_OPACITY;
 
