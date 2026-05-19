@@ -575,6 +575,12 @@ ${trkpts}
 		let mountedMap: LeafletMap | null = null;
 		let controlEditMarker: Marker | null = null;
 		let omapsRefreshTimeout: ReturnType<typeof setTimeout> | null = null;
+		// Screen Wake Lock state. The lock is automatically released when the tab
+		// becomes hidden (per spec); `wakeLockEnabled` records the user's intent
+		// so we can re-acquire on visibilitychange.
+		let wakeLockSentinel: WakeLockSentinel | null = null;
+		let wakeLockEnabled = false;
+		let wakeLockVisibilityHandler: (() => void) | null = null;
 
 		const initializeMap = async () => {
 			if (!mapContainer) return;
@@ -1370,7 +1376,80 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 				const trailControl = new TrailControl({ position: 'topright' });
 				trailControl.addTo(map);
 
+			// Screen Wake Lock control — only shown on touch-capable devices that
+			// support the Wake Lock API (i.e. mobile browsers). Keeps the display
+			// awake while orienteering so the user can glance at the map without
+			// the screen dimming or locking.
+			const supportsWakeLock = typeof navigator !== 'undefined' && 'wakeLock' in navigator;
+			const isTouchDevice =
+				typeof window !== 'undefined'
+				&& (navigator.maxTouchPoints > 0
+					|| window.matchMedia('(pointer: coarse)').matches);
+			if (supportsWakeLock && isTouchDevice) {
+				const acquireWakeLock = async () => {
+					try {
+						wakeLockSentinel = await navigator.wakeLock.request('screen');
+						wakeLockSentinel.addEventListener('release', () => {
+							wakeLockSentinel = null;
+						});
+					} catch {
+						wakeLockSentinel = null;
+					}
+				};
 
+				wakeLockVisibilityHandler = () => {
+					if (wakeLockEnabled && !wakeLockSentinel && document.visibilityState === 'visible') {
+						void acquireWakeLock();
+					}
+				};
+				document.addEventListener('visibilitychange', wakeLockVisibilityHandler);
+
+				const WakeLockControl = L.Control.extend({
+					onAdd: () => {
+						const container = L.DomUtil.create('div', 'leaflet-bar');
+						const wakeLockButton = L.DomUtil.create(
+							'button',
+							'map-wakelock-button',
+							container
+						) as HTMLButtonElement;
+						wakeLockButton.type = 'button';
+						wakeLockButton.title = 'Keep screen on';
+						wakeLockButton.setAttribute('aria-label', 'Toggle keep screen on');
+						wakeLockButton.setAttribute('aria-pressed', 'false');
+						// Lightbulb-style icon to suggest "screen stays lit".
+						wakeLockButton.innerHTML =
+							'<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">'
+							+ '<path d="M12 2a7 7 0 0 0-4 12.74V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.26A7 7 0 0 0 12 2zm-2 18v1a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1v-1h-4z"/>'
+							+ '</svg>';
+
+						L.DomEvent.disableClickPropagation(container);
+						L.DomEvent.on(wakeLockButton, 'click', () => {
+							if (!wakeLockEnabled) {
+								wakeLockEnabled = true;
+								wakeLockButton.classList.add('active');
+								wakeLockButton.setAttribute('aria-pressed', 'true');
+								wakeLockButton.title = 'Allow screen to sleep';
+								void acquireWakeLock();
+							} else {
+								wakeLockEnabled = false;
+								wakeLockButton.classList.remove('active');
+								wakeLockButton.setAttribute('aria-pressed', 'false');
+								wakeLockButton.title = 'Keep screen on';
+								const sentinel = wakeLockSentinel;
+								wakeLockSentinel = null;
+								if (sentinel) {
+									void sentinel.release().catch(() => {});
+								}
+							}
+						});
+
+						return container;
+					}
+				});
+
+				const wakeLockControl = new WakeLockControl({ position: 'topright' });
+				wakeLockControl.addTo(map);
+			}
 
 			map.on('baselayerchange', (event: LeafletEvent & { layer: Layer }) => {
 				const currentZoom = map.getZoom();
@@ -1701,6 +1780,15 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 		void initializeMap();
 
 		return () => {
+			if (wakeLockVisibilityHandler) {
+				document.removeEventListener('visibilitychange', wakeLockVisibilityHandler);
+				wakeLockVisibilityHandler = null;
+			}
+			wakeLockEnabled = false;
+			if (wakeLockSentinel) {
+				void wakeLockSentinel.release().catch(() => {});
+				wakeLockSentinel = null;
+			}
 			if (omapsRefreshTimeout) {
 				clearTimeout(omapsRefreshTimeout);
 			}
@@ -1896,6 +1984,33 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 	}
 
 	:global(.map-trail-button svg) {
+		width: 18px;
+		height: 18px;
+	}
+
+	:global(.map-wakelock-button) {
+		background-color: white;
+		border: none;
+		width: 36px;
+		height: 36px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+		color: #333;
+		transition: background-color 0.2s;
+	}
+
+	:global(.map-wakelock-button:hover) {
+		background-color: #f5f5f5;
+	}
+
+	:global(.map-wakelock-button.active) {
+		background-color: #f59e0b;
+		color: white;
+	}
+
+	:global(.map-wakelock-button svg) {
 		width: 18px;
 		height: 18px;
 	}
