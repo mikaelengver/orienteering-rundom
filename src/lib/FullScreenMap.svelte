@@ -1,7 +1,16 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { SvelteSet } from 'svelte/reactivity';
-	import type { Circle, CircleMarker, Layer, LeafletEvent, Map as LeafletMap, Marker, Polyline } from 'leaflet';
+	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+	import type {
+		Circle,
+		CircleMarker,
+		ImageOverlay,
+		Layer,
+		LeafletEvent,
+		Map as LeafletMap,
+		Marker,
+		Polyline
+	} from 'leaflet';
 	import locationSvg from '$lib/assets/location-crosshairs-solid-full.svg?raw';
 	import CoursePlannerModal from '$lib/CoursePlannerModal.svelte';
 	import { generateCourse, isNearControl, type OrienteeringCourse } from '$lib/courseGenerator';
@@ -17,6 +26,17 @@
 		controlIndex: number;
 		draftLat: number;
 		draftLng: number;
+	};
+
+	type OMapsPolygon = {
+		id: number;
+		hasImage: boolean;
+		area: number;
+		largeThumbnailUrl: string;
+		south: number;
+		north: number;
+		west: number;
+		east: number;
 	};
 
 	let mapContainer: HTMLDivElement | undefined;
@@ -61,6 +81,12 @@
 	const LOCATION_MAX_AGE_MS = 5000;
 	const LOCATION_TIMEOUT_MS = 10000;
 	const TRAIL_LOG_INTERVAL_MS = 3000; // Log position every 3 seconds
+	const OMAPS_REFRESH_DEBOUNCE_MS = 160;
+	const OMAPS_HIGHRES_MIN_ZOOM = 15;
+	const OMAPS_MAX_VISIBLE_OVERLAYS = 12;
+	const OMAPS_LOWRES_OPACITY = 0.5;
+	const OMAPS_HIGHRES_OPACITY = 1;
+	const OMAPS_HIGHRES_IMAGE_BASE_URL = 'https://www.omaps.net/se/Home/MapImage';
 
 	let map!: LeafletMap;
 	let isMapReady = false;
@@ -311,10 +337,33 @@ ${trkpts}
 		gpxDownloadName = `trail-${new Date().toISOString().slice(0, 10)}.gpx`;
 	}
 
+	function extractOmapsList(payload: unknown): unknown[] {
+		if (Array.isArray(payload)) return payload;
+		if (!payload || typeof payload !== 'object') return [];
+
+		const source = payload as Record<string, unknown>;
+		const keys = ['maps', 'items', 'data', 'result', 'value'];
+		for (const key of keys) {
+			if (Array.isArray(source[key])) {
+				return source[key] as unknown[];
+			}
+		}
+
+		return [];
+	}
+
+	function boundsOverlap(
+		a: { south: number; north: number; west: number; east: number },
+		b: { south: number; north: number; west: number; east: number }
+	): boolean {
+		return !(a.east < b.west || a.west > b.east || a.north < b.south || a.south > b.north);
+	}
+
 	onMount(() => {
 		let locationWatchId: number | null = null;
 		let mountedMap: LeafletMap | null = null;
 		let controlEditMarker: Marker | null = null;
+		let omapsRefreshTimeout: ReturnType<typeof setTimeout> | null = null;
 
 		const initializeMap = async () => {
 			if (!mapContainer) return;
@@ -454,6 +503,11 @@ ${trkpts}
 			const defaultCrs = L.CRS.EPSG3857;
 			const initialCrs = goKartorCrs ?? defaultCrs;
 			const initialMaxZoom = goKartorCrs ? 15 : 19;
+			let isOmapsLayerActive = false;
+			let omapsPolygons: OMapsPolygon[] | null = null;
+			let omapsPolygonsRequest: Promise<OMapsPolygon[]> | null = null;
+			const omapsOverlaysById = new SvelteMap<number, ImageOverlay>();
+			const omapsOverlayUrls = new SvelteMap<number, string>();
 
 			// Initialize map centered on the requested location in Älvsjö
 			map = L.map(mapContainer, {
@@ -491,6 +545,13 @@ ${trkpts}
 				maxZoom: 14
 			});
 
+			const omapsBackgroundLayer = L.tileLayer(MAP_CONFIGS.osm.url, {
+				attribution: MAP_CONFIGS.osm.attribution,
+				maxZoom: 19
+			});
+			const omapsOverlayGroup = L.layerGroup();
+			const omapsCompositeLayer = L.layerGroup([omapsBackgroundLayer, omapsOverlayGroup]);
+
 			const stockholmLayer = L.tileLayer.wms(MAP_CONFIGS.stockholmGra.url, {
 				format: 'image/png',
 				transparent: false,
@@ -503,9 +564,145 @@ ${trkpts}
 			goKartorLayer.addTo(map);
 			map.invalidateSize();
 
+			const clearOmapsOverlays = () => {
+				for (const overlay of omapsOverlaysById.values()) {
+					omapsOverlayGroup.removeLayer(overlay);
+				}
+				omapsOverlaysById.clear();
+				omapsOverlayUrls.clear();
+				if (omapsRefreshTimeout) {
+					clearTimeout(omapsRefreshTimeout);
+					omapsRefreshTimeout = null;
+				}
+			};
+
+			const loadOmapsPolygons = async (): Promise<OMapsPolygon[]> => {
+				if (omapsPolygons) return omapsPolygons;
+				if (omapsPolygonsRequest) return omapsPolygonsRequest;
+
+				omapsPolygonsRequest = (async () => {
+					const response = await fetch('/api/omaps/polygons');
+					if (!response.ok) {
+						throw new Error(`Omaps polygon request failed (${response.status})`);
+					}
+
+					const payload = (await response.json()) as unknown;
+					const polygons = extractOmapsList(payload)
+						.map((entry) => {
+							if (!entry || typeof entry !== 'object') return null;
+							const source = entry as Record<string, unknown>;
+							const polygon: OMapsPolygon = {
+								id: Number(source.id),
+								hasImage: Boolean(source.hasImage),
+								area: Number(source.area ?? 0),
+								largeThumbnailUrl: String(source.largeThumbnailUrl ?? ''),
+								south: Number(source.south),
+								north: Number(source.north),
+								west: Number(source.west),
+								east: Number(source.east)
+							};
+							if (
+								!Number.isFinite(polygon.id)
+								|| !Number.isFinite(polygon.south)
+								|| !Number.isFinite(polygon.north)
+								|| !Number.isFinite(polygon.west)
+								|| !Number.isFinite(polygon.east)
+							) {
+								return null;
+							}
+							return polygon;
+						})
+						.filter((polygon): polygon is OMapsPolygon => polygon !== null);
+
+					omapsPolygons = polygons;
+					return polygons;
+				})().finally(() => {
+					omapsPolygonsRequest = null;
+				});
+
+				return omapsPolygonsRequest;
+			};
+
+			const refreshOmapsOverlays = async () => {
+				if (!isOmapsLayerActive) return;
+
+				const mapBounds = map.getBounds();
+				const viewport = {
+					south: mapBounds.getSouth(),
+					north: mapBounds.getNorth(),
+					west: mapBounds.getWest(),
+					east: mapBounds.getEast()
+				};
+
+				try {
+					const zoom = map.getZoom();
+					const polygons = await loadOmapsPolygons();
+					const visiblePolygons = polygons
+						.filter((polygon) => polygon.hasImage && boundsOverlap(viewport, polygon))
+						.sort((a, b) => a.area - b.area)
+						.slice(0, OMAPS_MAX_VISIBLE_OVERLAYS);
+
+					const visibleIds = new SvelteSet<number>();
+					for (const polygon of visiblePolygons) {
+						visibleIds.add(polygon.id);
+						const useHighRes = zoom >= OMAPS_HIGHRES_MIN_ZOOM;
+						const imageUrl =
+							useHighRes
+								? `${OMAPS_HIGHRES_IMAGE_BASE_URL}/${polygon.id}`
+								: polygon.largeThumbnailUrl;
+						const imageBounds = L.latLngBounds(
+							[polygon.south, polygon.west],
+							[polygon.north, polygon.east]
+						);
+
+						const existing = omapsOverlaysById.get(polygon.id);
+						if (existing) {
+							if (omapsOverlayUrls.get(polygon.id) !== imageUrl) {
+								existing.setUrl(imageUrl);
+								omapsOverlayUrls.set(polygon.id, imageUrl);
+							}
+							existing.setBounds(imageBounds);
+							existing.setOpacity(useHighRes ? OMAPS_HIGHRES_OPACITY : OMAPS_LOWRES_OPACITY);
+							continue;
+						}
+
+						const overlay = L.imageOverlay(imageUrl, imageBounds, {
+							opacity: useHighRes ? OMAPS_HIGHRES_OPACITY : OMAPS_LOWRES_OPACITY,
+							interactive: false,
+							className: 'omaps-image-overlay'
+						});
+						overlay.addTo(omapsOverlayGroup);
+						omapsOverlaysById.set(polygon.id, overlay);
+						omapsOverlayUrls.set(polygon.id, imageUrl);
+					}
+
+					for (const [id, overlay] of omapsOverlaysById) {
+						if (visibleIds.has(id)) continue;
+						omapsOverlayGroup.removeLayer(overlay);
+						omapsOverlaysById.delete(id);
+						omapsOverlayUrls.delete(id);
+					}
+				} catch {
+					if (!error) {
+						error = 'Could not load Omaps overlays.';
+					}
+				}
+			};
+
+			const scheduleOmapsOverlayRefresh = () => {
+				if (!isOmapsLayerActive) return;
+				if (omapsRefreshTimeout) {
+					clearTimeout(omapsRefreshTimeout);
+				}
+				omapsRefreshTimeout = setTimeout(() => {
+					void refreshOmapsOverlays();
+				}, OMAPS_REFRESH_DEBOUNCE_MS);
+			};
+
 			// Create layer control
 			const baseLayers = {
 				GoKartor: goKartorLayer,
+				Omaps: omapsCompositeLayer,
 				OpenStreetMap: osmLayer,
 				CyclOSM: cyclosmLayer,
 				Stockholm: stockholmLayer
@@ -720,23 +917,31 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 			map.on('baselayerchange', (event: LeafletEvent & { layer: Layer }) => {
 				const currentZoom = map.getZoom();
 				const center = map.getCenter();
+				const nextLayerUsesGoKartorProjection = event.layer === goKartorLayer;
 
-				if (event.layer === goKartorLayer && !usingGoKartorCrs && goKartorCrs) {
+				if (nextLayerUsesGoKartorProjection && !usingGoKartorCrs && goKartorCrs) {
 					const nextZoom = Math.max(6, Math.min(15, currentZoom - 3));
 					map.options.crs = goKartorCrs;
 					map.setView(center, nextZoom, { animate: false });
 					map.invalidateSize(false);
 					map.setMaxZoom(14);
 					usingGoKartorCrs = true;
-				} else if (event.layer === goKartorLayer && !goKartorCrs) {
+				} else if (nextLayerUsesGoKartorProjection && !goKartorCrs) {
 					error = 'GoKartor displayed without projection (Proj4Leaflet not available).';
-				} else if (usingGoKartorCrs && event.layer !== goKartorLayer) {
+				} else if (usingGoKartorCrs && !nextLayerUsesGoKartorProjection) {
 					const nextZoom = Math.max(3, Math.min(19, currentZoom + 3));
 					map.options.crs = defaultCrs;
 					map.setView(center, nextZoom, { animate: false });
 					map.invalidateSize(false);
 					map.setMaxZoom(19);
 					usingGoKartorCrs = false;
+				}
+
+				isOmapsLayerActive = event.layer === omapsCompositeLayer;
+				if (isOmapsLayerActive) {
+					scheduleOmapsOverlayRefresh();
+				} else {
+					clearOmapsOverlays();
 				}
 			});
 
@@ -901,6 +1106,9 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 				if (activeCourse) {
 					drawCourse(activeCourse);
 				}
+				if (isOmapsLayerActive) {
+					scheduleOmapsOverlayRefresh();
+				}
 			});
 
 			// Load and draw a shared course from URL if present
@@ -912,7 +1120,6 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 			}
 
 			// Trail logging from location updates
-				const originalWatchId = locationWatchId;
 				if (locationWatchId !== null) {
 					navigator.geolocation.clearWatch(locationWatchId);
 				}
@@ -1013,6 +1220,9 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 		void initializeMap();
 
 		return () => {
+			if (omapsRefreshTimeout) {
+				clearTimeout(omapsRefreshTimeout);
+			}
 			if (gpxDownloadUrl) {
 				URL.revokeObjectURL(gpxDownloadUrl);
 			}
