@@ -1186,6 +1186,9 @@ ${trkpts}
 				const { latitude, longitude, accuracy } = position.coords;
 				const latLng = L.latLng(latitude, longitude);
 
+				// Update Svelte store for reactivity
+				userPosition = { lat: latitude, lng: longitude };
+
 				if (!userLocationMarker) {
 					userLocationMarker = L.circleMarker(latLng, {
 						radius: 8,
@@ -1216,6 +1219,19 @@ ${trkpts}
 					map.flyTo(latLng, targetZoom, { duration: 1 });
 				}
 			};
+// Keep blue dot in sync with map center when tracking is active
+map.on('move', () => {
+	if (isLocationTrackingActive && userLocationMarker) {
+		const center = map.getCenter();
+		userLocationMarker.setLatLng(center);
+		// Optionally update accuracy circle too
+		if (userAccuracyCircle) {
+			userAccuracyCircle.setLatLng(center);
+		}
+		// Also update Svelte store
+		userPosition = { lat: center.lat, lng: center.lng };
+	}
+});
 
 			const startLocationWatch = () => {
 				if (!isLocationTrackingActive && 'geolocation' in navigator) {
