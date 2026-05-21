@@ -113,6 +113,16 @@
 	let drawCourse: (course: OrienteeringCourse) => void = () => {};
 	let drawnCourseLayers: Layer[] = [];
 	let lastTrailLogTime = 0;
+	// Cached Leaflet module — populated inside initializeMap. Avoids repeated
+	// dynamic imports (which create new Promise chains every call) and removes
+	// the race window where multiple in-flight imports could each add a trail
+	// polyline to the map while only the latest is tracked.
+	let leafletLib: typeof import('leaflet') | null = null;
+	// Single shared AudioContext for checkpoint beeps. Browsers cap AudioContexts
+	// per page (Chrome ≈ 6), and an orienteering session can easily hit many
+	// checkpoints — creating a fresh context per beep used to leak resources and
+	// eventually fail silently or exhaust memory.
+	let sharedAudioContext: AudioContext | null = null;
 	const planIconPath = String(faCircleNodes.icon[4]);
 	const planIconWidth = Number(faCircleNodes.icon[0]);
 	const planIconHeight = Number(faCircleNodes.icon[1]);
@@ -319,28 +329,40 @@ ${trkpts}
 </gpx>`;
 	}
 
-	function updateTrailVisualization(trail: TrailPoint[]): void {
-		if (!isMapReady) return;
-
-		// Remove old polyline
-		if (trailPolyline) {
+	function clearTrailPolyline(): void {
+		if (trailPolyline && isMapReady) {
 			map.removeLayer(trailPolyline);
 		}
+		trailPolyline = null;
+	}
 
-		// Create new polyline from trail points
-		if (trail.length > 0) {
+	function updateTrailVisualization(trail: TrailPoint[]): void {
+		if (!isMapReady || !leafletLib) return;
+
+		if (trail.length === 0) {
+			clearTrailPolyline();
+			return;
+		}
+
+		if (!trailPolyline) {
 			const latLngs = trail.map((point) => [point.lat, point.lng] as [number, number]);
-			// Access Leaflet dynamically to avoid UMD global reference
-			import('leaflet').then((leaflet) => {
-				const L = leaflet.default;
-				trailPolyline = L.polyline(latLngs, {
+			trailPolyline = leafletLib
+				.polyline(latLngs, {
 					color: '#ffeb3b',
 					weight: 1,
 					opacity: 0.5,
 					className: 'trail-line'
-				}).addTo(map);
-			});
+				})
+				.addTo(map);
+			return;
 		}
+
+		// Append only the newest point instead of rebuilding the entire SVG path.
+		// Over a long ride this is the difference between O(1) and O(n) work per
+		// GPS update, and it avoids leaking the old polyline if the previous
+		// removeLayer call races with marker rendering.
+		const last = trail[trail.length - 1];
+		trailPolyline.addLatLng([last.lat, last.lng]);
 	}
 
 	function setGpxDownloadFromTrail(trail: TrailPoint[]): void {
@@ -589,6 +611,7 @@ ${trkpts}
 			// Dynamically import Leaflet
 			const leaflet = await import('leaflet');
 			const L = leaflet.default;
+			leafletLib = L as unknown as typeof import('leaflet');
 			// Side-effect import: registers L.imageOverlay.rotated for georeferenced
 			// rotated image overlays (used for high-res Omaps images).
 			await import('leaflet-imageoverlay-rotated');
@@ -1378,6 +1401,9 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 								}
 								recordedTrail = [];
 								lastTrailLogTime = 0;
+								// Drop any leftover polyline from a previous recording so the
+								// new session starts fresh and we don't keep two SVG paths alive.
+								clearTrailPolyline();
 								trailButton.classList.add('active');
 							} else {
 								trailButton.classList.remove('active');
@@ -1515,7 +1541,15 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 				}).webkitAudioContext;
 				if (!AudioContextCtor) return;
 
-				const audioContext = new AudioContextCtor();
+				// Reuse a single AudioContext across the session. Allocating a new one
+				// per beep leaks both memory and a limited platform resource.
+				if (!sharedAudioContext || sharedAudioContext.state === 'closed') {
+					sharedAudioContext = new AudioContextCtor();
+				}
+				const audioContext = sharedAudioContext;
+				if (audioContext.state === 'suspended') {
+					void audioContext.resume().catch(() => {});
+				}
 				const now = audioContext.currentTime;
 
 				// Create a beeping sound
@@ -1677,11 +1711,20 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 			// Assign drawCourse to outer scope
 			drawCourse = drawCourseImpl;
 
-			// Keep control rendering locked to map coordinates after map movements
-			map.on('zoomend moveend', () => {
+			// Redraw the course only when the zoom level changes. Route segments are
+			// clipped against marker borders using layer-point math, which is
+			// invariant under pan — re-running drawCourse on every `moveend` rebuilt
+			// every marker, popup and tooltip on each cycling-induced pan and was a
+			// major source of long-session memory churn.
+			map.on('zoomend', () => {
 				if (activeCourse) {
 					drawCourse(activeCourse);
 				}
+				if (isOmapsLayerActive) {
+					scheduleOmapsOverlayRefresh();
+				}
+			});
+			map.on('moveend', () => {
 				if (isOmapsLayerActive) {
 					scheduleOmapsOverlayRefresh();
 				}
@@ -1820,6 +1863,12 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 			if (locationWatchId !== null) {
 				navigator.geolocation.clearWatch(locationWatchId);
 			}
+			if (sharedAudioContext && sharedAudioContext.state !== 'closed') {
+				void sharedAudioContext.close().catch(() => {});
+			}
+			sharedAudioContext = null;
+			leafletLib = null;
+			trailPolyline = null;
 			if (mountedMap) {
 				mountedMap.remove();
 				isMapReady = false;
