@@ -348,9 +348,9 @@ ${trkpts}
 			const latLngs = trail.map((point) => [point.lat, point.lng] as [number, number]);
 			trailPolyline = leafletLib
 				.polyline(latLngs, {
-					color: '#ffeb3b',
-					weight: 1,
-					opacity: 0.5,
+					color: '#2563eb',
+					weight: 4,
+					opacity: 0.7,
 					className: 'trail-line'
 				})
 				.addTo(map);
@@ -1925,6 +1925,14 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 
 	:global(.leaflet-container) {
 		font-family: inherit;
+	}
+
+	/* Push the top-anchored Leaflet controls down so they clear the iOS/Android
+	   notch and status bar (and any browser top chrome). Without this the
+	   layer/zoom/location buttons can land under the safe-area inset on phones
+	   and become hard to tap. */
+	:global(.leaflet-top) {
+		top: calc(env(safe-area-inset-top, 0px) + 100px);
 	}
 
 	:global(.leaflet-popup-content-wrapper) {
