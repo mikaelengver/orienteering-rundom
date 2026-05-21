@@ -1985,11 +1985,15 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 		line-height: 44px !important;
 	}
 
-	:global(.map-location-button) {
+	/* Right-side custom controls match the left-side zoom buttons (44x44). */
+	:global(.map-location-button),
+	:global(.map-planner-button),
+	:global(.map-trail-button),
+	:global(.map-wakelock-button) {
 		background-color: white;
 		border: none;
-		width: 36px;
-		height: 36px;
+		width: 44px;
+		height: 44px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -1998,8 +2002,19 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 		transition: background-color 0.2s;
 	}
 
-	:global(.map-location-button:hover) {
+	:global(.map-location-button:hover),
+	:global(.map-planner-button:hover),
+	:global(.map-trail-button:hover),
+	:global(.map-wakelock-button:hover) {
 		background-color: #f5f5f5;
+	}
+
+	:global(.map-location-button svg),
+	:global(.map-planner-button svg),
+	:global(.map-trail-button svg),
+	:global(.map-wakelock-button svg) {
+		width: 22px;
+		height: 22px;
 	}
 
 	:global(.map-location-button.active) {
@@ -2007,85 +2022,14 @@ locationButton.innerHTML = locationSvg.replace('<svg', '<svg width="18" height="
 		color: white;
 	}
 
-	:global(.map-location-button svg) {
-		width: 18px;
-		height: 18px;
-	}
-
-	:global(.map-planner-button) {
-		background-color: white;
-		border: none;
-		width: 36px;
-		height: 36px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		cursor: pointer;
-		color: #333;
-		transition: background-color 0.2s;
-	}
-
-	:global(.map-planner-button:hover) {
-		background-color: #f5f5f5;
-	}
-
-	:global(.map-planner-button svg) {
-		width: 18px;
-		height: 18px;
-	}
-
-	:global(.map-trail-button) {
-		background-color: white;
-		border: none;
-		width: 36px;
-		height: 36px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		cursor: pointer;
-		color: #333;
-		transition: background-color 0.2s;
-	}
-
-	:global(.map-trail-button:hover) {
-		background-color: #f5f5f5;
-	}
-
 	:global(.map-trail-button.active) {
 		background-color: #ef4444;
 		color: white;
 	}
 
-	:global(.map-trail-button svg) {
-		width: 18px;
-		height: 18px;
-	}
-
-	:global(.map-wakelock-button) {
-		background-color: white;
-		border: none;
-		width: 36px;
-		height: 36px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		cursor: pointer;
-		color: #333;
-		transition: background-color 0.2s;
-	}
-
-	:global(.map-wakelock-button:hover) {
-		background-color: #f5f5f5;
-	}
-
 	:global(.map-wakelock-button.active) {
 		background-color: #f59e0b;
 		color: white;
-	}
-
-	:global(.map-wakelock-button svg) {
-		width: 18px;
-		height: 18px;
 	}
 
 	:global(.trail-line) {
